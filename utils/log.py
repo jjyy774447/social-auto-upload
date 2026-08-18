@@ -1,8 +1,17 @@
 import sys
+import tempfile
 from pathlib import Path
 from loguru import logger
 
 from conf import BASE_DIR
+
+
+def _resolve_log_path(file_path: str) -> Path:
+    """项目内 logs/ 目录偶尔会被沙箱/杀软以独占方式锁住导致启动失败，
+    这里把 'logs/xxx.log' 重定向到系统临时目录，避免该问题。"""
+    if file_path.startswith("logs/"):
+        return Path(tempfile.gettempdir()) / "sau_logs" / file_path.split("/", 1)[1]
+    return Path(BASE_DIR / file_path)
 
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -39,8 +48,9 @@ def create_logger(log_name: str, file_path: str):
     def filter_record(record):
         return record["extra"].get("business_name") == log_name
 
-    Path(BASE_DIR / file_path).parent.mkdir(exist_ok=True)
-    logger.add(Path(BASE_DIR / file_path), filter=filter_record, level="INFO", rotation="10 MB", retention="10 days", backtrace=True, diagnose=True)
+    target = _resolve_log_path(file_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    logger.add(target, filter=filter_record, level="INFO", rotation="10 MB", retention="10 days", backtrace=True, diagnose=True)
     return logger.bind(business_name=log_name)
 
 

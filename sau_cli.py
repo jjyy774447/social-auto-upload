@@ -81,6 +81,9 @@ class DouyinNoteUploadRequest:
     debug: bool = True
     headless: bool = True
     bgm: str = ""
+    cdp_url: str | None = None
+    cover_path: str = ""
+    no_publish: bool = False
 
 
 @dataclass(slots=True)
@@ -366,7 +369,7 @@ async def upload_video(request: DouyinVideoUploadRequest) -> Path:
 
 async def upload_note(request: DouyinNoteUploadRequest) -> Path:
     account_file = resolve_account_file("douyin", request.account_name)
-    is_ready = await douyin_setup(str(account_file), handle=False)
+    is_ready = await douyin_setup(str(account_file), handle=False, cdp_url=request.cdp_url)
     if not is_ready:
         raise RuntimeError(
             f"Douyin cookie is missing or expired: {account_file}. Run `sau douyin login --account {request.account_name}` first."
@@ -383,6 +386,9 @@ async def upload_note(request: DouyinNoteUploadRequest) -> Path:
         debug=request.debug,
         headless=request.headless,
         bgm=request.bgm,
+        cdp_url=request.cdp_url,
+        cover_path=request.cover_path or None,
+        no_publish=request.no_publish,
     )
     await app.douyin_upload_note()
     return account_file
@@ -617,6 +623,22 @@ def build_parser() -> argparse.ArgumentParser:
     upload_note_parser.add_argument("--tags", default="", help="Comma-separated tags, such as tag1,tag2")
     upload_note_parser.add_argument("--bgm", default="", help="BGM music name to search and select")
     upload_note_parser.add_argument("--schedule", type=schedule_value, help=f"Schedule time in {schedule_help}")
+    upload_note_parser.add_argument(
+        "--cdp-url",
+        default=None,
+        help="连接已启动调试端口的真实 Chrome（如 http://127.0.0.1:9222），直接驱动你的 Chrome 而非另起无头浏览器；"
+             "需你先以 --remote-debugging-port=9222 启动 Chrome",
+    )
+    upload_note_parser.add_argument(
+        "--cover",
+        default="",
+        help="图文独立封面图片路径(不进轮播，单独上传为封面)",
+    )
+    upload_note_parser.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="预览模式：完成图片/标题/标签/封面/预约时间设置后，不点击「发布」，仅截图与回读预约时间供核对",
+    )
     add_runtime_flags(upload_note_parser)
 
     kuaishou_parser = platform_parsers.add_parser("kuaishou", help="Kuaishou operations")
@@ -798,6 +820,9 @@ async def dispatch(args: argparse.Namespace) -> int:
                 debug=args.debug,
                 headless=args.headless,
                 bgm=args.bgm or "",
+                cdp_url=args.cdp_url,
+                cover_path=args.cover,
+                no_publish=args.no_publish,
             )
             await upload_note(request)
             print(f"Douyin note upload submitted: {len(request.image_files)} images")

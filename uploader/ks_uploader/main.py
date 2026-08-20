@@ -11,7 +11,7 @@ from patchright.async_api import Page
 from patchright.async_api import Playwright
 from patchright.async_api import async_playwright
 
-from conf import DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
+from conf import BASE_DIR, DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 from uploader.base_video import BaseVideoUploader
 from utils.base_social_media import set_init_script
 from utils.files_times import get_absolute_path
@@ -176,6 +176,11 @@ async def cookie_auth(account_file):
 
 async def ks_setup(account_file, handle=False, return_detail=False, qrcode_callback=None, headless: bool = LOCAL_CHROME_HEADLESS, cdp_url: str | None = None):
     account_file = get_absolute_path(account_file, "ks_uploader")
+    # CDP 直连真实 Chrome：用户已在真实浏览器里登录，跳过无头 cookie 校验，
+    # 否则会另起一个无头 Chromium（正是"提交走无头"的根源）。
+    if cdp_url:
+        result = _build_login_result(True, "cookie_valid", "CDP 模式跳过 cookie 校验", account_file)
+        return result if return_detail else True
     if not os.path.exists(account_file) or not await cookie_auth(account_file):
         if not handle:
             result = _build_login_result(False, "cookie_invalid", "cookie文件不存在或已失效", account_file)
@@ -287,6 +292,8 @@ class KSBaseUploader(BaseVideoUploader):
         publish_strategy: str | None = None,
         debug: bool = DEBUG_MODE,
         headless: bool = LOCAL_CHROME_HEADLESS,
+        cdp_url: str | None = None,
+        no_publish: bool = False,
     ):
         self.publish_date = publish_date
         self.account_file = str(account_file)
@@ -295,11 +302,17 @@ class KSBaseUploader(BaseVideoUploader):
         self.headless = headless
         self.local_executable_path = LOCAL_CHROME_PATH
         self.date_format = "%Y-%m-%d %H:%M"
+        self.cdp_url = cdp_url
+        self.no_publish = no_publish
 
     async def validate_base_args(self):
-        if not os.path.exists(self.account_file):
+        if not self.cdp_url and not os.path.exists(self.account_file):
             raise RuntimeError(f"cookie文件不存在，请先完成快手登录: {self.account_file}")
-        if not await cookie_auth(self.account_file):
+        # CDP 直连真实 Chrome 时，用户会话已在真实浏览器里登录，
+        # 跳过无头 cookie 校验（否则会另起一个无头 Chromium，正是"提交走无头"的根源）。
+        if self.cdp_url:
+            kuaishou_logger.info(_msg("🔗", "CDP 模式：跳过无头 cookie 校验，直接复用你的 Chrome 会话"))
+        elif not await cookie_auth(self.account_file):
             raise RuntimeError(f"cookie文件已失效，请先完成快手登录: {self.account_file}")
 
         if self.publish_strategy is None:
@@ -323,40 +336,43 @@ class KSBaseUploader(BaseVideoUploader):
     async def set_schedule_time(self, page: Page, publish_date: datetime):
         kuaishou_logger.info(_msg("🕒", "小人准备设置定时发布时间"))
         publish_date_str = publish_date.strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            # 1. 切换到"定时发布"radio
+            await page.locator('label.ant-radio-wrapper', has_text="定时发布").click()
+            await asyncio.sleep(1.5)
 
-        # 1. 切换到"定时发布"radio (用文本匹配更稳)
-        await page.locator('label.ant-radio-wrapper').filter(has_text="定时发布").click()
-        await asyncio.sleep(2)
+            # 2. 等待时间输入框出现（antd DatePicker: input[placeholder="选择日期时间"], readonly）
+            picker = page.locator('input[placeholder="选择日期时间"]')
+            await picker.wait_for(state="visible", timeout=8000)
+            await picker.click()
+            await asyncio.sleep(0.5)
 
-        # 2. 点击 picker 打开下拉面板
-        await page.locator('input[placeholder="选择日期时间"]').click()
-        await asyncio.sleep(1)
+            # 3. 用 React 兼容方式写入（readonly 输入框不能用 .fill()，需用 native setter + 派发事件）
+            js_code = """
+            (newValue) => {
+                const input = document.querySelector('input[placeholder="选择日期时间"]');
+                if (!input) return false;
+                const nativeSetter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value'
+                ).set;
+                nativeSetter.call(input, newValue);
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                return true;
+            }
+            """
+            ok = await page.evaluate(js_code, publish_date_str)
+            if not ok:
+                kuaishou_logger.error("❌ 找不到时间选择器输入框")
+                return
 
-        # 3. 用 React 兼容的方式直接设置 input 的 value
-        #    (ant-design DatePicker 是 controlled component, 必须用 native setter + bubbling event)
-        js_code = """
-        (newValue) => {
-            const input = document.querySelector('input[placeholder="选择日期时间"]');
-            if (!input) return false;
-            const nativeSetter = Object.getOwnPropertyDescriptor(
-                window.HTMLInputElement.prototype, 'value'
-            ).set;
-            nativeSetter.call(input, newValue);
-            input.dispatchEvent(new Event('input', { bubbles: true }));
-            input.dispatchEvent(new Event('change', { bubbles: true }));
-            return true;
-        }
-        """
-        ok = await page.evaluate(js_code, publish_date_str)
-        if not ok:
-            kuaishou_logger.error("❌ 找不到时间选择器输入框")
-            return
-
-        await asyncio.sleep(1)
-        # 4. 按 Enter 确认
-        await page.keyboard.press("Enter")
-        await asyncio.sleep(2)
-        kuaishou_logger.info(f"✅ 定时发布时间已设置为 {publish_date_str}")
+            await asyncio.sleep(1)
+            # 4. 按 Enter 确认
+            await page.keyboard.press("Enter")
+            await asyncio.sleep(2)
+            kuaishou_logger.info(_msg("✅", f"定时发布时间已设置为 {publish_date_str}"))
+        except Exception as exc:
+            kuaishou_logger.warning(_msg("🕒", f"设置定时发布失败（可忽略）: {exc}"))
 
     async def close_guide_overlay(self, page: Page) -> bool:
         joyride_tooltip = page.locator('div[id^="react-joyride-step"] div[role="alertdialog"]')
@@ -379,6 +395,145 @@ class KSBaseUploader(BaseVideoUploader):
         else:
             print("未检测到 Joyride 遮罩，继续执行")
 
+    async def select_bgm(self, page: Page, bgm_name: str) -> bool:
+        """为快手图文选择配乐。
+
+        实测：编辑器里的入口文案是「添加音乐」，但页面上同时存在同名 <label>（表单标签，
+        点击无效）与真正的可点击按钮（div._button）。因此点击时须排除 LABEL。
+        真正的配乐面板是一个 .ant-drawer「选择音乐」抽屉，内含 placeholder="搜索音乐" 的
+        搜索框与每首歌对应的「添加」按钮（div[class*='button-primary']）。
+        未命中 / 异常均跳过，不中断发布。
+        """
+        try:
+            # 1) 点击「添加音乐」按钮（排除 <label>，否则点到表单标签不生效）
+            opened = await page.evaluate(
+                """() => {
+                    const els = Array.from(document.querySelectorAll('*')).filter(
+                        el => (el.innerText || '').trim() === '添加音乐'
+                            && el.offsetParent !== null
+                            && el.tagName !== 'LABEL'
+                    );
+                    if (els.length) { els[0].click(); return true; }
+                    return false;
+                }"""
+            )
+            if not opened:
+                kuaishou_logger.warning(_msg("🎵", "未找到「添加音乐」按钮，跳过 BGM 设置"))
+                return False
+
+            # 2) 等待「选择音乐」抽屉与搜索框出现
+            try:
+                await page.locator(".ant-drawer-open input[placeholder='搜索音乐']").wait_for(timeout=8000)
+            except Exception:
+                kuaishou_logger.warning(_msg("🎵", "未打开「选择音乐」抽屉，跳过 BGM 设置"))
+                return False
+
+            # 3) 在抽屉内搜索
+            search = page.locator(".ant-drawer-open input[placeholder='搜索音乐']")
+            await search.click()
+            await search.fill(bgm_name)
+            await page.keyboard.press("Enter")
+            await asyncio.sleep(3)
+
+            # 4) 点击第一首结果的「添加」按钮（button-primary）
+            add = page.locator(".ant-drawer-open div[class*='button-primary']").first
+            if not (await add.count()):
+                kuaishou_logger.warning(_msg("🎵", f"未找到「{bgm_name}」的添加按钮，跳过 BGM"))
+                return False
+            await add.click(timeout=6000, force=True)
+            await asyncio.sleep(2)
+
+            # 5) 校验：抽屉自动关闭，且「作品未添加音乐」消失
+            attached = await page.evaluate(
+                "() => !document.body.innerText.includes('作品未添加音乐')"
+            )
+            if attached:
+                kuaishou_logger.info(_msg("🥳", f"BGM「{bgm_name}」已添加"))
+                return True
+            kuaishou_logger.warning(_msg("🎵", f"BGM「{bgm_name}」似乎未成功添加，请预览中确认"))
+            return False
+        except Exception as exc:
+            kuaishou_logger.warning(_msg("🎵", f"添加快手 BGM 时出错，跳过该步骤继续发布：{exc}"))
+            return False
+
+    async def set_note_cover(self, page: Page, cover_path: str) -> None:
+        """快手图文自定义封面：打开封面编辑器 → 切到「上传封面」→ set_input_files 上传 → 完成。
+
+        实测：封面设置入口是「编辑封面」（并非「预览封面」预览页签）；点击后弹出 ant-modal，
+        内含「封面截取 / 上传封面」两个页签。选「上传封面」后弹层内出现**真实的 <input type=file>**，
+        和视频封面上传机制一致，直接 `set_input_files()` 即可。
+        上传后裁剪区加载出图片，再点弹层内可见的「完成」按钮应用封面。
+
+        ⚠️ 成功判定以「弹层关闭后，笔记主界面出现『已自定义封面』」为准，避免弹层内占位文本误报。
+        未命中入口 / 异常均跳过，不中断发布。
+        """
+        if not cover_path:
+            return
+        try:
+            # 已是自定义封面则跳过（幂等，重跑不重复弹层）
+            if await page.evaluate("() => document.body.innerText.includes('已自定义封面')"):
+                kuaishou_logger.info(_msg("🖼️", "已是自定义封面，跳过封面设置"))
+                return
+
+            # 1) 打开封面编辑器
+            entry = page.get_by_text("编辑封面", exact=True).first
+            if not (await entry.count() and await entry.is_visible()):
+                kuaishou_logger.warning(_msg("🖼️", "未找到「编辑封面」入口，跳过封面"))
+                return
+            await entry.click()
+            modal = page.locator(".ant-modal").first
+            await modal.wait_for(state="visible", timeout=10000)
+
+            async def try_upload() -> bool:
+                # 切到「上传封面」页签
+                tab = modal.get_by_text("上传封面", exact=True).first
+                if await tab.count() and await tab.is_visible():
+                    await tab.click()
+                    await asyncio.sleep(2)
+                # 直接对弹层内的 file input 传文件
+                file_input = modal.locator("input[type=file]").first
+                if not (await file_input.count()):
+                    return False
+                await file_input.wait_for(state="attached", timeout=10000)
+                await file_input.set_input_files(cover_path)
+                # 等待封面图加载到裁剪区
+                await asyncio.sleep(6)
+                # 点弹层内可见的「完成」按钮（图文封面的确认按钮文案为「完成」）
+                for label in ("完成", "确认"):
+                    btns = await modal.get_by_text(label, exact=True).all()
+                    for d in btns:
+                        try:
+                            if await d.is_visible():
+                                await d.click()
+                                await asyncio.sleep(2.5)
+                                return True
+                        except Exception:
+                            continue
+                return False
+
+            await try_upload()
+            # 弹层关闭后，以主界面是否出现「已自定义封面」判定
+            await asyncio.sleep(1)
+            custom = await page.evaluate("() => document.body.innerText.includes('已自定义封面')")
+            if not custom:
+                # 重试一次：先关可能残留的弹层，再重开重传
+                kuaishou_logger.warning(_msg("🖼️", "封面首次未生效，重试一次"))
+                close = modal.locator("[class*='header-close']").first
+                if await close.count():
+                    await close.click()
+                    await asyncio.sleep(1.5)
+                await entry.click()
+                await modal.wait_for(state="visible", timeout=10000)
+                await try_upload()
+                await asyncio.sleep(1)
+                custom = await page.evaluate("() => document.body.innerText.includes('已自定义封面')")
+            if custom:
+                kuaishou_logger.info(_msg("🖼️", "快手图文自定义封面已设置"))
+            else:
+                kuaishou_logger.warning(_msg("🖼️", "自定义封面可能未生效，请预览中确认"))
+        except Exception as exc:
+            kuaishou_logger.warning(_msg("🖼️", f"设置快手图文封面异常（可忽略）: {exc}"))
+
 
 class KSVideo(KSBaseUploader):
     def __init__(
@@ -393,6 +548,8 @@ class KSVideo(KSBaseUploader):
         headless: bool = LOCAL_CHROME_HEADLESS,
         thumbnail_path=None,
         desc: str | None = None,
+        cdp_url: str | None = None,
+        no_publish: bool = False,
     ):
         super().__init__(
             publish_date=publish_date,
@@ -400,6 +557,8 @@ class KSVideo(KSBaseUploader):
             publish_strategy=publish_strategy,
             debug=debug,
             headless=headless,
+            cdp_url=cdp_url,
+            no_publish=no_publish,
         )
         self.title = title
         self.file_path = file_path
@@ -453,17 +612,32 @@ class KSVideo(KSBaseUploader):
         await self.validate_upload_args()
         kuaishou_logger.info(_msg("🥳", "上传前检查通过"))
 
-        if self.local_executable_path:
+        if self.cdp_url:
+            # CDP 直连用户真实 Chrome：由用户自行以 --remote-debugging-port 启动，
+            # 我们 connect_over_cdp 接管，绝不另起浏览器，因此不会抢锁/误杀用户的 Chrome。
+            # 关键：复用用户实时登录的 contexts[0]，而不是新建隔离 context——
+            # 否则用户刚在 Chrome 里手动登录的快手会话不会带进上传 context，会卡在登录页。
+            kuaishou_logger.info(_msg("🔗", f"通过 CDP 连接你的 Chrome: {self.cdp_url}"))
+            browser = await playwright.chromium.connect_over_cdp(self.cdp_url)
+            context = browser.contexts[0] if browser.contexts else await browser.new_context(
+                storage_state=self.account_file,
+                permissions=["geolocation"],
+            )
+            should_close_browser = False
+        elif self.local_executable_path:
             browser = await playwright.chromium.launch(
                 headless=self.headless,
                 executable_path=self.local_executable_path,
             )
+            context = await browser.new_context(storage_state=self.account_file)
+            should_close_browser = True
         else:
             browser = await playwright.chromium.launch(
                 headless=self.headless,
                 channel="chromium",
             )
-        context = await browser.new_context(storage_state=self.account_file)
+            context = await browser.new_context(storage_state=self.account_file)
+            should_close_browser = True
         context = await set_init_script(context)
 
         upload_success = False
@@ -535,6 +709,30 @@ class KSVideo(KSBaseUploader):
             if self.publish_strategy == KUAISHOU_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
                 await self.set_schedule_time(page, self.publish_date)
 
+            # ── 预览模式：所有准备（视频/描述/标签/封面/预约）已完成，
+            #    仅跳过「发布」点击，截图 + 回读预约时间供人工核对 ──
+            if self.no_publish:
+                kuaishou_logger.info(_msg("🛑", "预览模式：已跳过「发布」点击，表单/封面/预约时间均已就绪，供人工核对"))
+                try:
+                    await page.evaluate("window.scrollTo(0, 0)")
+                    await asyncio.sleep(1)
+                    await page.screenshot(path=os.path.join(BASE_DIR, "progress_preview.png"))
+                    await page.screenshot(path=os.path.join(BASE_DIR, "progress_preview_top.png"))
+                except Exception:
+                    pass
+                sched_str = ""
+                if self.publish_strategy == KUAISHOU_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
+                    sched_str = self.publish_date.strftime("%Y-%m-%d %H:%M")
+                    try:
+                        val = await page.locator('input[placeholder="选择日期时间"]').input_value(timeout=3000)
+                        kuaishou_logger.info(_msg("🕒", f"预览核对：页面预约输入框值 = {val!r}"))
+                    except Exception:
+                        pass
+                kuaishou_logger.info(_msg("🕒", f"预览核对：发布策略={self.publish_strategy}, 预约时间={sched_str or '立即发布'}"))
+                kuaishou_logger.info(_msg("🛑", "预览结束，未执行发布（progress_preview.png 已保存）"))
+                upload_success = True
+                return
+
             while True:
                 try:
                     publish_button = page.get_by_text("发布", exact=True)
@@ -561,8 +759,26 @@ class KSVideo(KSBaseUploader):
                 await context.storage_state(path=self.account_file)
                 kuaishou_logger.success(_msg("🥳", "cookie 更新完毕"))
                 await asyncio.sleep(2)
-            await context.close()
-            await browser.close()
+            if self.no_publish:
+                # 预览模式：保持浏览器/页面打开，交给用户主动关闭（方便慢慢核对显示）。
+                # 关键：必须等用户真正关闭页面后才 return，否则 async_playwright() 退出时
+                # playwright.stop() 会关闭我们通过 connect_over_cdp 新建的 context，页面就被关掉了。
+                kuaishou_logger.info("=" * 60)
+                kuaishou_logger.info(_msg("🛑", "预览模式：表单/封面/预约已就绪，浏览器保持打开，请核对后手动关闭该 Chrome 标签页/窗口"))
+                kuaishou_logger.info(_msg("🛑", "（关闭页面后脚本自动退出；在您关闭之前，页面不会被脚本关闭）"))
+                kuaishou_logger.info("=" * 60)
+                page_ref = locals().get("page")
+                if page_ref is not None:
+                    try:
+                        await page_ref.wait_for_event("close", timeout=1800_000)  # 最多等 30 分钟
+                        kuaishou_logger.info(_msg("🛑", "检测到页面已关闭，预览结束，脚本退出"))
+                    except Exception:
+                        kuaishou_logger.info(_msg("🛑", "预览等待超时（30 分钟），自动结束"))
+                return
+            if not self.cdp_url:
+                await context.close()
+            if should_close_browser:
+                await browser.close()
 
     async def main(self):
         async with async_playwright() as playwright:
@@ -581,6 +797,10 @@ class KSNote(KSBaseUploader):
         publish_strategy: str | None = None,
         debug: bool = DEBUG_MODE,
         headless: bool = LOCAL_CHROME_HEADLESS,
+        bgm: str = "",
+        cdp_url: str | None = None,
+        cover_path: str | None = None,
+        no_publish: bool = False,
     ):
         super().__init__(
             publish_date=publish_date,
@@ -588,11 +808,15 @@ class KSNote(KSBaseUploader):
             publish_strategy=publish_strategy,
             debug=debug,
             headless=headless,
+            cdp_url=cdp_url,
+            no_publish=no_publish,
         )
         self.image_paths = image_paths
         self.note = note or ""
         self.title = title or (self.note[:20] if self.note else "")
         self.tags = tags or []
+        self.bgm = bgm or ""
+        self.cover_path = cover_path
 
     async def validate_upload_args(self):
         await self.validate_base_args()
@@ -609,11 +833,24 @@ class KSNote(KSBaseUploader):
             normalized_image_paths.append(str(self.validate_image_file(image_path)))
         self.image_paths = normalized_image_paths
 
+        if self.cover_path:
+            self.cover_path = str(self.validate_image_file(self.cover_path))
+
     async def upload_note_content(self, page: Page) -> None:
         kuaishou_logger.info(_msg("🏃", f"小人开始搬运图文，共 {len(self.image_paths)} 张图片"))
         kuaishou_logger.info(_msg("🔀", "小人正在切换到图文发布"))
         await page.locator('div[role="tablist"] div[role="tab"]:has-text("图文")').click()
         await page.wait_for_timeout(1000)
+
+        # 处理草稿恢复弹窗：若存在「继续编辑 / 放弃」，优先点「放弃」以得到干净编辑器再重新上传，
+        # 避免恢复旧草稿后又重复上传导致图片翻倍。
+        for dlg_label in ("放弃", "继续编辑"):
+            dlg = page.get_by_text(dlg_label, exact=True).first
+            if await dlg.count() and await dlg.is_visible():
+                kuaishou_logger.info(_msg("🗂️", f"检测到草稿恢复弹窗，点击「{dlg_label}」"))
+                await dlg.click()
+                await page.wait_for_timeout(1500)
+                break
 
         kuaishou_logger.info(_msg("📤", "小人正在上传图片"))
         upload_button = page.locator("button[class^='_upload-btn']").filter(has_text="上传图片")
@@ -671,8 +908,44 @@ class KSNote(KSBaseUploader):
         if retry_count == max_retries:
             kuaishou_logger.warning(_msg("😵", "超过最大重试次数，图文上传可能未完成"))
 
+        # 配乐（尽力而为，搜不到/异常均跳过不中断）
+        if self.bgm:
+            try:
+                await self.select_bgm(page, self.bgm)
+            except Exception as exc:
+                kuaishou_logger.warning(_msg("🎵", f"配乐设置出错，跳过该步骤: {exc}"))
+
+        # 图文独立封面（从已上传图片中选，尽力而为）
+        try:
+            await self.set_note_cover(page, self.cover_path)
+        except Exception as exc:
+            kuaishou_logger.warning(_msg("🖼️", f"封面设置出错，跳过该步骤: {exc}"))
+
         if self.publish_strategy == KUAISHOU_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
-            await self.set_schedule_time(page, self.publish_date)
+            try:
+                await self.set_schedule_time(page, self.publish_date)
+            except Exception as exc:
+                kuaishou_logger.warning(_msg("🕒", f"预约设置出错，跳过该步骤: {exc}"))
+
+        # ── 预览模式：所有准备（图片/标题/标签/配乐/封面/预约）已完成，
+        #    仅跳过「发布」点击，截图 + 回读预约时间供人工核对 ──
+        if self.no_publish:
+            kuaishou_logger.info(_msg("🛑", "预览模式：已跳过「发布」点击，表单/封面/预约时间均已就绪，供人工核对"))
+            try:
+                await page.screenshot(path=os.path.join(BASE_DIR, "progress_preview.png"))
+            except Exception:
+                pass
+            sched_str = ""
+            if self.publish_strategy == KUAISHOU_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
+                sched_str = self.publish_date.strftime("%Y-%m-%d %H:%M")
+                try:
+                    val = await page.locator('input[placeholder="选择日期时间"]').input_value(timeout=3000)
+                    kuaishou_logger.info(_msg("🕒", f"预览核对：页面预约输入框值 = {val!r}"))
+                except Exception:
+                    pass
+            kuaishou_logger.info(_msg("🕒", f"预览核对：发布策略={self.publish_strategy}, 预约时间={sched_str or '立即发布'}"))
+            kuaishou_logger.info(_msg("🛑", "预览结束，未执行发布（progress_preview.png 已保存）"))
+            return
 
         while True:
             try:
@@ -699,17 +972,32 @@ class KSNote(KSBaseUploader):
         await self.validate_upload_args()
         kuaishou_logger.info(_msg("🥳", "图文上传前检查通过"))
 
-        if self.local_executable_path:
+        if self.cdp_url:
+            # CDP 直连用户真实 Chrome：由用户自行以 --remote-debugging-port 启动，
+            # 我们 connect_over_cdp 接管，绝不另起浏览器，因此不会抢锁/误杀用户的 Chrome。
+            # 关键：复用用户实时登录的 contexts[0]，而不是新建隔离 context——
+            # 否则用户刚在 Chrome 里手动登录的快手会话不会带进上传 context，会卡在登录页。
+            kuaishou_logger.info(_msg("🔗", f"通过 CDP 连接你的 Chrome: {self.cdp_url}"))
+            browser = await playwright.chromium.connect_over_cdp(self.cdp_url)
+            context = browser.contexts[0] if browser.contexts else await browser.new_context(
+                storage_state=self.account_file,
+                permissions=["geolocation"],
+            )
+            should_close_browser = False
+        elif self.local_executable_path:
             browser = await playwright.chromium.launch(
                 headless=self.headless,
                 executable_path=self.local_executable_path,
             )
+            context = await browser.new_context(storage_state=self.account_file)
+            should_close_browser = True
         else:
             browser = await playwright.chromium.launch(
                 headless=self.headless,
                 channel="chromium",
             )
-        context = await browser.new_context(storage_state=self.account_file)
+            context = await browser.new_context(storage_state=self.account_file)
+            should_close_browser = True
         context = await set_init_script(context)
 
         upload_success = False
@@ -726,8 +1014,26 @@ class KSNote(KSBaseUploader):
                 await context.storage_state(path=self.account_file)
                 kuaishou_logger.success(_msg("🥳", "cookie 更新完毕"))
                 await asyncio.sleep(2)
-            await context.close()
-            await browser.close()
+            if self.no_publish:
+                # 预览模式：保持浏览器/页面打开，交给用户主动关闭（方便慢慢核对显示）。
+                # 关键：必须等用户真正关闭页面后才 return，否则 async_playwright() 退出时
+                # playwright.stop() 会关闭我们通过 connect_over_cdp 新建的 context，页面就被关掉了。
+                kuaishou_logger.info("=" * 60)
+                kuaishou_logger.info(_msg("🛑", "预览模式：表单/封面/预约已就绪，浏览器保持打开，请核对后手动关闭该 Chrome 标签页/窗口"))
+                kuaishou_logger.info(_msg("🛑", "（关闭页面后脚本自动退出；在您关闭之前，页面不会被脚本关闭）"))
+                kuaishou_logger.info("=" * 60)
+                page_ref = locals().get("page")
+                if page_ref is not None:
+                    try:
+                        await page_ref.wait_for_event("close", timeout=1800_000)  # 最多等 30 分钟
+                        kuaishou_logger.info(_msg("🛑", "检测到页面已关闭，预览结束，脚本退出"))
+                    except Exception:
+                        kuaishou_logger.info(_msg("🛑", "预览等待超时（30 分钟），自动结束"))
+                return
+            if not self.cdp_url:
+                await context.close()
+            if should_close_browser:
+                await browser.close()
 
     async def main(self):
         async with async_playwright() as playwright:

@@ -11,7 +11,7 @@ from patchright.async_api import Page
 from patchright.async_api import Playwright
 from patchright.async_api import async_playwright
 
-from conf import DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
+from conf import BASE_DIR, DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 from uploader.base_video import BaseVideoUploader
 from utils.base_social_media import set_init_script
 from utils.login_qrcode import build_login_qrcode_path
@@ -202,7 +202,12 @@ async def xiaohongshu_setup(
     return_detail=False,
     qrcode_callback=None,
     headless: bool = LOCAL_CHROME_HEADLESS,
+    cdp_url: str | None = None,
 ):
+    # CDP 直连真实 Chrome：用户已在真实浏览器里登录，跳过无头 cookie 校验
+    if cdp_url:
+        result = _build_login_result(True, "cookie_valid", "CDP 模式跳过 cookie 校验", account_file)
+        return result if return_detail else True
     if not os.path.exists(account_file) or not await cookie_auth(account_file):
         if not handle:
             result = _build_login_result(False, "cookie_invalid", "cookie文件不存在或已失效", account_file)
@@ -294,6 +299,8 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
         publish_strategy: str = XIAOHONGSHU_PUBLISH_STRATEGY_IMMEDIATE,
         debug: bool = DEBUG_MODE,
         headless: bool = LOCAL_CHROME_HEADLESS,
+        cdp_url: str | None = None,
+        no_publish: bool = False,
     ):
         self.publish_date = publish_date
         self.account_file = str(account_file)
@@ -302,11 +309,16 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
         self.date_format = "%Y年%m月%d日 %H:%M"
         self.local_executable_path = LOCAL_CHROME_PATH
         self.headless = headless
+        self.cdp_url = cdp_url
+        self.no_publish = no_publish
 
     async def validate_base_args(self):
-        if not os.path.exists(self.account_file):
+        if not self.cdp_url and not os.path.exists(self.account_file):
             raise RuntimeError(f"cookie文件不存在，请先完成小红书登录: {self.account_file}")
-        if not await cookie_auth(self.account_file):
+        # CDP 直连真实 Chrome 时，用户会话已在真实浏览器里登录，跳过无头 cookie 校验
+        if self.cdp_url:
+            xiaohongshu_logger.info(_msg("🔗", "CDP 模式：跳过无头 cookie 校验，直接复用你的 Chrome 会话"))
+        elif not await cookie_auth(self.account_file):
             raise RuntimeError(f"cookie文件已失效，请先完成小红书登录: {self.account_file}")
 
         if self.publish_strategy not in {
@@ -656,6 +668,8 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
         publish_strategy: str = XIAOHONGSHU_PUBLISH_STRATEGY_IMMEDIATE,
         debug: bool = DEBUG_MODE,
         headless: bool = LOCAL_CHROME_HEADLESS,
+        cdp_url: str | None = None,
+        no_publish: bool = False,
     ):
         super().__init__(
             publish_date=publish_date,
@@ -663,6 +677,8 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
             publish_strategy=publish_strategy,
             debug=debug,
             headless=headless,
+            cdp_url=cdp_url,
+            no_publish=no_publish,
         )
         self.image_paths = image_paths
         self.note = note or ""
@@ -720,6 +736,18 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
         if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
             await self.set_schedule_time_xiaohongshu(page, self.publish_date)
 
+        # ── 预览模式：图文/封面/预约已完成，仅跳过「发布」点击，截图供人工核对 ──
+        if self.no_publish:
+            xiaohongshu_logger.info(_msg("🛑", "预览模式：已跳过「发布」点击，图文/封面/预约均已就绪，供人工核对"))
+            try:
+                await page.evaluate("window.scrollTo(0, 0)")
+                await asyncio.sleep(1)
+                await page.screenshot(path=os.path.join(BASE_DIR, "progress_preview.png"))
+            except Exception:
+                pass
+            xiaohongshu_logger.info(_msg("🛑", "预览结束，未执行发布（progress_preview.png 已保存）"))
+            return
+
         while True:
             try:
                 if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED:
@@ -742,21 +770,74 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
         xiaohongshu_logger.info(_msg("🧍", "小人先检查 cookie、图片和发布时间"))
         await self.validate_upload_args()
         xiaohongshu_logger.info(_msg("🥳", "图文上传前检查通过"))
-        browser = await playwright.chromium.launch(headless=self.headless, channel="chromium")
-        context = await browser.new_context(
-            permissions=["geolocation"],
-            storage_state=self.account_file,
-        )
+
+        if self.cdp_url:
+            # CDP 直连用户真实 Chrome：由用户自行以 --remote-debugging-port 启动，
+            # 我们 connect_over_cdp 接管，绝不另起浏览器，因此不会抢锁/误杀用户的 Chrome。
+            # 关键：复用用户实时登录的 contexts[0]，而不是新建隔离 context——
+            # 否则用户刚在 Chrome 里手动登录的小红书会话不会带进上传 context，会卡在登录页。
+            xiaohongshu_logger.info(_msg("🔗", f"通过 CDP 连接你的 Chrome: {self.cdp_url}"))
+            browser = await playwright.chromium.connect_over_cdp(self.cdp_url)
+            context = browser.contexts[0] if browser.contexts else await browser.new_context(
+                storage_state=self.account_file,
+                permissions=["geolocation"],
+            )
+            should_close_browser = False
+        elif self.local_executable_path:
+            browser = await playwright.chromium.launch(
+                headless=self.headless,
+                executable_path=self.local_executable_path,
+            )
+            context = await browser.new_context(
+                permissions=["geolocation"],
+                storage_state=self.account_file,
+            )
+            should_close_browser = True
+        else:
+            browser = await playwright.chromium.launch(
+                headless=self.headless,
+                channel="chromium",
+            )
+            context = await browser.new_context(
+                permissions=["geolocation"],
+                storage_state=self.account_file,
+            )
+            should_close_browser = True
         context = await set_init_script(context)
 
+        upload_success = False
         try:
             page = await context.new_page()
             await self.upload_note_content(page)
-            await context.storage_state(path=self.account_file)
-            xiaohongshu_logger.success(_msg("🥳", "cookie 更新完毕"))
+            upload_success = True
         finally:
-            await context.close()
-            await browser.close()
+            if upload_success:
+                try:
+                    await context.storage_state(path=self.account_file)
+                    xiaohongshu_logger.success(_msg("🥳", "cookie 更新完毕"))
+                except Exception:
+                    pass
+                await asyncio.sleep(2)
+            if self.no_publish:
+                # 预览模式：保持浏览器/页面打开，交给用户主动关闭（方便慢慢核对显示）。
+                # 必须等用户真正关闭页面后才 return，否则 async_playwright() 退出时
+                # playwright.stop() 会关闭我们通过 connect_over_cdp 新建的 context，页面就被关掉了。
+                xiaohongshu_logger.info("=" * 60)
+                xiaohongshu_logger.info(_msg("🛑", "预览模式：图文/封面/预约已就绪，浏览器保持打开，请核对后手动关闭该 Chrome 标签页/窗口"))
+                xiaohongshu_logger.info(_msg("🛑", "（关闭页面后脚本自动退出；在您关闭之前，页面不会被脚本关闭）"))
+                xiaohongshu_logger.info("=" * 60)
+                page_ref = locals().get("page")
+                if page_ref is not None:
+                    try:
+                        await page_ref.wait_for_event("close", timeout=1800_000)  # 最多等 30 分钟
+                        xiaohongshu_logger.info(_msg("🛑", "检测到页面已关闭，预览结束，脚本退出"))
+                    except Exception:
+                        xiaohongshu_logger.info(_msg("🛑", "预览等待超时（30 分钟），自动结束"))
+                return
+            if not self.cdp_url:
+                await context.close()
+            if should_close_browser:
+                await browser.close()
 
     async def xiaohongshu_upload_note(self):
         async with async_playwright() as playwright:

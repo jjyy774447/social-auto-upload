@@ -98,6 +98,8 @@ class KuaishouVideoUploadRequest:
     publish_strategy: str = KUAISHOU_PUBLISH_STRATEGY_IMMEDIATE
     debug: bool = True
     headless: bool = True
+    cdp_url: str | None = None
+    no_publish: bool = False
 
 
 @dataclass(slots=True)
@@ -111,6 +113,10 @@ class KuaishouNoteUploadRequest:
     publish_strategy: str = KUAISHOU_PUBLISH_STRATEGY_IMMEDIATE
     debug: bool = True
     headless: bool = True
+    bgm: str = ""
+    cdp_url: str | None = None
+    cover_path: str = ""
+    no_publish: bool = False
 
 
 @dataclass(slots=True)
@@ -138,6 +144,9 @@ class XiaohongshuNoteUploadRequest:
     publish_strategy: str = XIAOHONGSHU_PUBLISH_STRATEGY_IMMEDIATE
     debug: bool = True
     headless: bool = True
+    cdp_url: str | None = None
+    cover_path: str = ""
+    no_publish: bool = False
 
 
 @dataclass(slots=True)
@@ -396,7 +405,7 @@ async def upload_note(request: DouyinNoteUploadRequest) -> Path:
 
 async def upload_kuaishou_video(request: KuaishouVideoUploadRequest) -> Path:
     account_file = resolve_account_file("kuaishou", request.account_name)
-    is_ready = await ks_setup(str(account_file), handle=False)
+    is_ready = await ks_setup(str(account_file), handle=False, cdp_url=request.cdp_url)
     if not is_ready:
         raise RuntimeError(
             f"Kuaishou cookie is missing or expired: {account_file}. Run `sau kuaishou login --account {request.account_name}` first."
@@ -413,6 +422,8 @@ async def upload_kuaishou_video(request: KuaishouVideoUploadRequest) -> Path:
         publish_strategy=request.publish_strategy,
         debug=request.debug,
         headless=request.headless,
+        cdp_url=request.cdp_url,
+        no_publish=request.no_publish,
     )
     await app.main()
     return account_file
@@ -420,7 +431,7 @@ async def upload_kuaishou_video(request: KuaishouVideoUploadRequest) -> Path:
 
 async def upload_kuaishou_note(request: KuaishouNoteUploadRequest) -> Path:
     account_file = resolve_account_file("kuaishou", request.account_name)
-    is_ready = await ks_setup(str(account_file), handle=False)
+    is_ready = await ks_setup(str(account_file), handle=False, cdp_url=request.cdp_url)
     if not is_ready:
         raise RuntimeError(
             f"Kuaishou cookie is missing or expired: {account_file}. Run `sau kuaishou login --account {request.account_name}` first."
@@ -436,6 +447,10 @@ async def upload_kuaishou_note(request: KuaishouNoteUploadRequest) -> Path:
         publish_strategy=request.publish_strategy,
         debug=request.debug,
         headless=request.headless,
+        bgm=request.bgm,
+        cdp_url=request.cdp_url,
+        cover_path=request.cover_path or None,
+        no_publish=request.no_publish,
     )
     await app.main()
     return account_file
@@ -467,14 +482,19 @@ async def upload_xiaohongshu_video(request: XiaohongshuVideoUploadRequest) -> Pa
 
 async def upload_xiaohongshu_note(request: XiaohongshuNoteUploadRequest) -> Path:
     account_file = resolve_account_file("xiaohongshu", request.account_name)
-    is_ready = await xiaohongshu_setup(str(account_file), handle=False)
+    is_ready = await xiaohongshu_setup(str(account_file), handle=False, cdp_url=request.cdp_url)
     if not is_ready:
         raise RuntimeError(
             f"Xiaohongshu cookie is missing or expired: {account_file}. Run `sau xiaohongshu login --account {request.account_name}` first."
         )
 
+    # 自定义封面：小红书封面默认取首图，把封面图插到图文第一张即可
+    image_files = list(request.image_files)
+    if request.cover_path:
+        image_files = [Path(request.cover_path)] + image_files
+
     app = XiaoHongShuNote(
-        image_paths=[str(path) for path in request.image_files],
+        image_paths=[str(path) for path in image_files],
         title=request.title,
         desc=request.note,
         note=request.note,
@@ -484,6 +504,8 @@ async def upload_xiaohongshu_note(request: XiaohongshuNoteUploadRequest) -> Path
         publish_strategy=request.publish_strategy,
         debug=request.debug,
         headless=request.headless,
+        cdp_url=request.cdp_url,
+        no_publish=request.no_publish,
     )
     await app.main()
     return account_file
@@ -658,6 +680,17 @@ def build_parser() -> argparse.ArgumentParser:
     kuaishou_upload_video_parser.add_argument("--tags", default="", help="Comma-separated tags, such as tag1,tag2")
     kuaishou_upload_video_parser.add_argument("--schedule", type=schedule_value, help=f"Schedule time in {schedule_help}")
     kuaishou_upload_video_parser.add_argument("--thumbnail", type=existing_file_path, help="Optional thumbnail path")
+    kuaishou_upload_video_parser.add_argument(
+        "--cdp-url",
+        default=None,
+        help="连接已启动调试端口的真实 Chrome（如 http://127.0.0.1:9222），直接驱动你的 Chrome 而非另起无头浏览器；"
+             "需你先以 --remote-debugging-port=9222 启动 Chrome",
+    )
+    kuaishou_upload_video_parser.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="预览模式：完成视频/描述/标签/封面/预约时间设置后，不点击「发布」，仅截图与回读预约时间供核对",
+    )
     add_runtime_flags(kuaishou_upload_video_parser)
 
     kuaishou_upload_note_parser = kuaishou_actions.add_parser("upload-note", help="Upload one note to Kuaishou")
@@ -665,8 +698,26 @@ def build_parser() -> argparse.ArgumentParser:
     kuaishou_upload_note_parser.add_argument("--images", required=True, nargs="+", type=existing_file_path, help="Image file paths")
     kuaishou_upload_note_parser.add_argument("--title", required=True, help="Note title")
     kuaishou_upload_note_parser.add_argument("--note", default="", help="Optional note content")
+    kuaishou_upload_note_parser.add_argument("--notef", default="", help="Read note content from file (txt/md)")
     kuaishou_upload_note_parser.add_argument("--tags", default="", help="Comma-separated tags, such as tag1,tag2")
+    kuaishou_upload_note_parser.add_argument("--bgm", default="", help="BGM music name to search and select")
     kuaishou_upload_note_parser.add_argument("--schedule", type=schedule_value, help=f"Schedule time in {schedule_help}")
+    kuaishou_upload_note_parser.add_argument(
+        "--cdp-url",
+        default=None,
+        help="连接已启动调试端口的真实 Chrome（如 http://127.0.0.1:9222），直接驱动你的 Chrome 而非另起无头浏览器；"
+             "需你先以 --remote-debugging-port=9222 启动 Chrome",
+    )
+    kuaishou_upload_note_parser.add_argument(
+        "--cover",
+        default="",
+        help="图文独立封面图片路径(从已上传图片中选取，不进轮播)；快手封面只能选已上传图片之一",
+    )
+    kuaishou_upload_note_parser.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="预览模式：完成图片/标题/标签/封面/预约时间设置后，不点击「发布」，仅截图与回读预约时间供核对",
+    )
     add_runtime_flags(kuaishou_upload_note_parser)
 
     xiaohongshu_parser = platform_parsers.add_parser("xiaohongshu", help="Xiaohongshu operations")
@@ -695,6 +746,22 @@ def build_parser() -> argparse.ArgumentParser:
     xiaohongshu_upload_note_parser.add_argument("--note", default="", help="Optional note content")
     xiaohongshu_upload_note_parser.add_argument("--tags", default="", help="Comma-separated tags, such as tag1,tag2")
     xiaohongshu_upload_note_parser.add_argument("--schedule", type=schedule_value, help=f"Schedule time in {schedule_help}")
+    xiaohongshu_upload_note_parser.add_argument(
+        "--cdp-url",
+        default=None,
+        help="连接已启动调试端口的真实 Chrome（如 http://127.0.0.1:9222），直接驱动你的 Chrome 而非另起无头浏览器；"
+             "需你先以 --remote-debugging-port=9222 启动 Chrome",
+    )
+    xiaohongshu_upload_note_parser.add_argument(
+        "--cover",
+        default="",
+        help="自定义封面图路径：小红书封面默认取首图，脚本会把该图插到图文第一张作为封面（不单独上传）",
+    )
+    xiaohongshu_upload_note_parser.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="预览模式：完成图片/标题/标签/封面/预约时间设置后，不点击「发布」，浏览器保持打开供核对",
+    )
     add_runtime_flags(xiaohongshu_upload_note_parser)
 
     bilibili_parser = platform_parsers.add_parser("bilibili", help="Bilibili operations")
@@ -857,22 +924,37 @@ async def dispatch(args: argparse.Namespace) -> int:
                 publish_strategy=publish_strategy,
                 debug=args.debug,
                 headless=args.headless,
+                cdp_url=args.cdp_url,
+                no_publish=args.no_publish,
             )
             await upload_kuaishou_video(request)
             print(f"Kuaishou video upload submitted: {request.video_file}")
             return 0
 
         if args.action == "upload-note":
+            # 如果指定了 --notef，读取文件内容作为 note
+            note_content = args.note
+            if args.notef:
+                note_file = Path(args.notef)
+                if not note_file.exists():
+                    print(f"错误：文件不存在: {note_file}", file=sys.stderr)
+                    return 1
+                note_content = note_file.read_text(encoding="utf-8")
+
             request = KuaishouNoteUploadRequest(
                 account_name=args.account,
                 image_files=parse_image_files(args.images),
                 title=args.title,
-                note=args.note,
+                note=note_content,
                 tags=parse_tags(args.tags),
                 publish_date=args.schedule or 0,
                 publish_strategy=publish_strategy,
                 debug=args.debug,
                 headless=args.headless,
+                bgm=args.bgm or "",
+                cdp_url=args.cdp_url,
+                cover_path=args.cover,
+                no_publish=args.no_publish,
             )
             await upload_kuaishou_note(request)
             print(f"Kuaishou note upload submitted: {len(request.image_files)} images")
@@ -933,6 +1015,9 @@ async def dispatch(args: argparse.Namespace) -> int:
                 publish_strategy=publish_strategy,
                 debug=args.debug,
                 headless=args.headless,
+                cdp_url=args.cdp_url,
+                cover_path=args.cover,
+                no_publish=args.no_publish,
             )
             await upload_xiaohongshu_note(request)
             print(f"Xiaohongshu note upload submitted: {len(request.image_files)} images")

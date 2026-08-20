@@ -68,6 +68,29 @@ sau kuaishou upload-video --account <account_name> --file videos/demo.mp4 --titl
 sau kuaishou upload-note --account <account_name> --images videos/1.png videos/2.png videos/3.png --title "图文标题" --note "图文示例" --tags 图文,测试
 ```
 
+快手图文（`upload-note`）已与抖音图文能力对齐，额外支持以下增强参数（视频 `upload-video` 也支持 `--cdp-url` / `--no-publish`）：
+
+```bash
+# 快手图文：配乐 + 预约 + CDP 直连 + 预览模式
+sau kuaishou upload-note --account <account_name> \
+    --images videos/1.png videos/2.png videos/3.png \
+    --title "图文标题" --note "图文示例" --tags 图文,测试 \
+    --bgm "琵琶语" --schedule "2026-08-18 21:30" \
+    --cdp-url http://127.0.0.1:9222 --no-publish
+
+# 快手视频：CDP 直连 + 预览模式
+sau kuaishou upload-video --account <account_name> --file videos/demo.mp4 \
+    --title "示例标题" --desc "示例简介" --tags 运动,训练 \
+    --cdp-url http://127.0.0.1:9222 --no-publish
+```
+
+- `--bgm <曲名>`：按名搜索并选配乐（搜不到/未命中入口自动跳过，不中断发布）。
+- `--cdp-url <url>`：连接你已开启调试端口的真实 Chrome，复用已登录会话、避免另起无头浏览器（需先 `--remote-debugging-port=9222` 启动 Chrome）。
+- `--cover <图片>`：图文封面；快手封面只能从已上传图片中选取，故按文件名匹配已上传图（外部独立封面为抖音特性）。
+- `--no-publish`：预览模式，完成所有设置后**不点发布**，截图 `progress_preview.png` 并回读预约时间，保持浏览器打开等你手动关闭核对。
+
+完整工作流、参数对照表与注意事项见 **[`kuaishou-upload-guide.md`](./kuaishou-upload-guide.md)**。
+
 ## 小红书 CLI 子命令
 
 ```bash
@@ -195,5 +218,21 @@ Bilibili 额外要求：
 - 抖音：最多 35 张图片，不支持 GIF
 - 快手：支持多张图片，建议传真实不同文件，不要把同一路径重复多次
 - 小红书：支持多张图片，正文 `--note` 可选，但 `--title` 建议始终显式传入
+
+## 增强参数（抖音 / 快手 图文）
+
+抖音与快手的图文上传（`upload-note`）均支持以下增强参数，用于对齐「复用已登录浏览器 + 预览核对」的工作流：
+
+```bash
+--bgm <曲名>          按名搜索并选配乐（搜不到/未命中入口自动跳过，不中断发布）
+--cdp-url <url>       连接已开启调试端口的真实 Chrome（如 http://127.0.0.1:9222），
+                      复用已登录会话、避免另起无头浏览器触发登录/短信验证；
+                      需先以 --remote-debugging-port=9222 启动 Chrome
+--cover <图片>        图文独立封面；抖音可直接上传外部文件，快手只能从已上传图片中选取
+--no-publish          预览模式：完成图片/标题/标签/配乐/封面/预约设置后不点「发布」，
+                      仅截图 progress_preview.png 并回读预约时间，保持浏览器打开等你手动关闭
+```
+
+完整工作流、参数对照表与注意事项见 **[`kuaishou-upload-guide.md`](./kuaishou-upload-guide.md)**。
 
 后续维护 CLI 时，优先看 `sau_cli.py`、`uploader/` 和 `skills/`。
